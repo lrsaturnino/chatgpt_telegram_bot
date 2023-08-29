@@ -11,9 +11,8 @@ if config.openai_api_base is not None:
 
 
 OPENAI_COMPLETION_OPTIONS = {
-    "temperature": 0.7,
-    "max_tokens": 1000,
-    "top_p": 1,
+    "temperature": 0,
+    "max_tokens": 3000,
     "frequency_penalty": 0,
     "presence_penalty": 0
 }
