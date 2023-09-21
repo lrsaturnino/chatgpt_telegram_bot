@@ -2,6 +2,7 @@ import config
 
 import tiktoken
 import openai
+import logging
 
 
 # setup openai
@@ -9,6 +10,7 @@ openai.api_key = config.openai_api_key
 if config.openai_api_base is not None:
     openai.api_base = config.openai_api_base
 
+logger = logging.getLogger(__name__)
 
 OPENAI_COMPLETION_OPTIONS = {
     "temperature": 0,
@@ -23,7 +25,7 @@ class ChatGPT:
         assert model in {"text-davinci-003", "gpt-3.5-turbo-16k", "gpt-3.5-turbo", "gpt-4"}, f"Unknown model: {model}"
         self.model = model
 
-    async def send_message(self, message, dialog_messages=[], chat_mode="assistant"):
+    async def send_message(self, message, dialog_messages=[], chat_mode="assistant", chat_type="prompt_default"):
         if chat_mode not in config.chat_modes.keys():
             raise ValueError(f"Chat mode {chat_mode} is not supported")
 
@@ -32,15 +34,16 @@ class ChatGPT:
         while answer is None:
             try:
                 if self.model in {"gpt-3.5-turbo-16k", "gpt-3.5-turbo", "gpt-4"}:
-                    messages = self._generate_prompt_messages(message, dialog_messages, chat_mode)
+                    messages = self._generate_prompt_messages(message, dialog_messages, chat_mode, chat_type)
                     r = await openai.ChatCompletion.acreate(
                         model=self.model,
                         messages=messages,
                         **OPENAI_COMPLETION_OPTIONS
                     )
+                    print(r)
                     answer = r.choices[0].message["content"]
                 elif self.model == "text-davinci-003":
-                    prompt = self._generate_prompt(message, dialog_messages, chat_mode)
+                    prompt = self._generate_prompt(message, dialog_messages, chat_mode, chat_type)
                     r = await openai.Completion.acreate(
                         engine=self.model,
                         prompt=prompt,
@@ -63,7 +66,7 @@ class ChatGPT:
 
         return answer, (n_input_tokens, n_output_tokens), n_first_dialog_messages_removed
 
-    async def send_message_stream(self, message, dialog_messages=[], chat_mode="assistant"):
+    async def send_message_stream(self, message, dialog_messages=[], chat_mode="assistant", chat_type="prompt_default"):
         if chat_mode not in config.chat_modes.keys():
             raise ValueError(f"Chat mode {chat_mode} is not supported")
 
@@ -72,7 +75,7 @@ class ChatGPT:
         while answer is None:
             try:
                 if self.model in {"gpt-3.5-turbo-16k", "gpt-3.5-turbo", "gpt-4"}:
-                    messages = self._generate_prompt_messages(message, dialog_messages, chat_mode)
+                    messages = self._generate_prompt_messages(message, dialog_messages, chat_mode, chat_type)
                     r_gen = await openai.ChatCompletion.acreate(
                         model=self.model,
                         messages=messages,
@@ -89,7 +92,7 @@ class ChatGPT:
                             n_first_dialog_messages_removed = n_dialog_messages_before - len(dialog_messages)
                             yield "not_finished", answer, (n_input_tokens, n_output_tokens), n_first_dialog_messages_removed
                 elif self.model == "text-davinci-003":
-                    prompt = self._generate_prompt(message, dialog_messages, chat_mode)
+                    prompt = self._generate_prompt(message, dialog_messages, chat_mode, chat_type)
                     r_gen = await openai.Completion.acreate(
                         engine=self.model,
                         prompt=prompt,
@@ -115,8 +118,8 @@ class ChatGPT:
 
         yield "finished", answer, (n_input_tokens, n_output_tokens), n_first_dialog_messages_removed  # sending final answer
 
-    def _generate_prompt(self, message, dialog_messages, chat_mode):
-        prompt = config.chat_modes[chat_mode]["prompt_start"]
+    def _generate_prompt(self, message, dialog_messages, chat_mode, chat_type):
+        prompt = config.chat_modes[chat_mode][chat_type]
         prompt += "\n\n"
 
         # add chat context
@@ -132,8 +135,8 @@ class ChatGPT:
 
         return prompt
 
-    def _generate_prompt_messages(self, message, dialog_messages, chat_mode):
-        prompt = config.chat_modes[chat_mode]["prompt_start"]
+    def _generate_prompt_messages(self, message, dialog_messages, chat_mode, chat_type):
+        prompt = config.chat_modes[chat_mode][chat_type]
 
         messages = [{"role": "system", "content": prompt}]
         for dialog_message in dialog_messages:

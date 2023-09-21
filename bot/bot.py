@@ -207,7 +207,7 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
         await generate_image_handle(update, context, message=message)
         return
 
-    async def message_handle_fn():
+    async def message_handle_fn(chat_type):
         # new dialog timeout
         if use_new_dialog_timeout:
             if (datetime.now() - db.get_user_attribute(user_id, "last_interaction")).seconds > config.new_dialog_timeout and len(db.get_dialog_messages(user_id)) > 0:
@@ -238,12 +238,13 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
 
             chatgpt_instance = openai_utils.ChatGPT(model=current_model)
             if config.enable_message_streaming:
-                gen = chatgpt_instance.send_message_stream(_message, dialog_messages=dialog_messages, chat_mode=chat_mode)
+                gen = chatgpt_instance.send_message_stream(_message, dialog_messages=dialog_messages, chat_mode=chat_mode, chat_type=chat_type)
             else:
                 answer, (n_input_tokens, n_output_tokens), n_first_dialog_messages_removed = await chatgpt_instance.send_message(
                     _message,
                     dialog_messages=dialog_messages,
-                    chat_mode=chat_mode
+                    chat_mode=chat_mode,
+                    chat_type=chat_type
                 )
 
                 async def fake_gen():
@@ -303,18 +304,23 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
             await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
     async with user_semaphores[user_id]:
-        task = asyncio.create_task(message_handle_fn())
-        user_tasks[user_id] = task
+        types = []
+        types.append('prompt_evaluation')
+        types.append('prompt_answer')
+        for type in types:
+            try:    
+                task = asyncio.create_task(message_handle_fn(type))
+                await task
+                user_tasks[user_id] = task
+            except asyncio.CancelledError:
+                await update.message.reply_text("✅ Canceled", parse_mode=ParseMode.HTML)
+            else:
+                pass
+            finally:
+                if user_id in user_tasks:
+                    del user_tasks[user_id]
 
-        try:
-            await task
-        except asyncio.CancelledError:
-            await update.message.reply_text("✅ Canceled", parse_mode=ParseMode.HTML)
-        else:
-            pass
-        finally:
-            if user_id in user_tasks:
-                del user_tasks[user_id]
+
 
 
 async def is_previous_message_not_answered_yet(update: Update, context: CallbackContext):
