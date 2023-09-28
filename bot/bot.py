@@ -9,8 +9,10 @@ import pydub
 from pathlib import Path
 from datetime import datetime
 import openai
-
+import re
 import telegram
+
+
 from telegram import (
     Update,
     User,
@@ -18,6 +20,7 @@ from telegram import (
     InlineKeyboardMarkup,
     BotCommand
 )
+
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -28,12 +31,12 @@ from telegram.ext import (
     AIORateLimiter,
     filters
 )
+
 from telegram.constants import ParseMode, ChatAction
 
 import config
 import database
 import openai_utils
-
 
 # setup
 db = database.Database()
@@ -41,6 +44,10 @@ logger = logging.getLogger(__name__)
 
 user_semaphores = {}
 user_tasks = {}
+chat_types = []
+eval_message = None
+update_storage = {}
+context_storage = {}
 
 HELP_MESSAGE = """Commands:
 ⚪ /retry – Regenerate last bot answer
@@ -65,7 +72,6 @@ Instructions (see <b>video</b> below):
 To get a reply from the bot in the chat – @ <b>tag</b> it or <b>reply</b> to its message.
 For example: "{bot_username} write a poem about Telegram"
 """
-
 
 def split_text_into_chunks(text, chunk_size):
     for i in range(0, len(text), chunk_size):
@@ -180,7 +186,6 @@ async def retry_handle(update: Update, context: CallbackContext):
 
     await message_handle(update, context, message=last_dialog_message["user"], use_new_dialog_timeout=False)
 
-
 async def message_handle(update: Update, context: CallbackContext, message=None, use_new_dialog_timeout=True):
     # check if bot was mentioned (for group chats)
     if not await is_bot_mentioned(update, context):
@@ -190,9 +195,11 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
     if update.edited_message is not None:
         await edited_message_handle(update, context)
         return
+    
+    print('update_inside_message', update)
 
     _message = message or update.message.text
-
+    
     # remove bot mention (in group chats)
     if update.message.chat.type != "private":
         _message = _message.replace("@" + context.bot.username, "").strip()
@@ -207,7 +214,20 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
         await generate_image_handle(update, context, message=message)
         return
 
-    async def message_handle_fn(chat_type):
+    async def message_handle_fn(chat_type, _message=_message, update=update, context=context):
+        
+        global eval_message
+        global update_storage
+        global context_storage
+
+        reply_markup = None
+
+        if chat_type == 'prompt_answer':
+            update_storage = update
+            context_storage = context
+            reply_markup = await get_options()
+
+
         # new dialog timeout
         if use_new_dialog_timeout:
             if (datetime.now() - db.get_user_attribute(user_id, "last_interaction")).seconds > config.new_dialog_timeout and len(db.get_dialog_messages(user_id)) > 0:
@@ -227,10 +247,18 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
             await update.message.chat.send_action(action="typing")
 
             if _message is None or len(_message) == 0:
-                 await update.message.reply_text("🥲 You sent <b>empty message</b>. Please, try again!", parse_mode=ParseMode.HTML)
-                 return
+                await update.message.reply_text("🥲 You sent <b>empty message</b>. Please, try again!", parse_mode=ParseMode.HTML)
+                return
+            
+            if eval_message is not None:
+                _message = eval_message
+                eval_message = None
+            
+            dialog_messages = []
 
-            dialog_messages = db.get_dialog_messages(user_id, dialog_id=None)
+            if chat_type != 'prompt_evaluation' and chat_type != 'prompt_translation' and chat_type != 'prompt_vocabulary' and chat_type != 'prompt_artist':
+                dialog_messages = db.get_dialog_messages(user_id, dialog_id=None)
+
             parse_mode = {
                 "html": ParseMode.HTML,
                 "markdown": ParseMode.MARKDOWN
@@ -253,6 +281,7 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
                 gen = fake_gen()
 
             prev_answer = ""
+
             async for gen_item in gen:
                 status, answer, (n_input_tokens, n_output_tokens), n_first_dialog_messages_removed = gen_item
 
@@ -263,24 +292,30 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
                     continue
 
                 try:
-                    await context.bot.edit_message_text(answer, chat_id=placeholder_message.chat_id, message_id=placeholder_message.message_id, parse_mode=parse_mode)
+                    await context.bot.edit_message_text(answer, reply_markup=reply_markup, chat_id=placeholder_message.chat_id, message_id=placeholder_message.message_id, parse_mode=parse_mode)
                 except telegram.error.BadRequest as e:
                     if str(e).startswith("Message is not modified"):
                         continue
                     else:
-                        await context.bot.edit_message_text(answer, chat_id=placeholder_message.chat_id, message_id=placeholder_message.message_id)
+                        await context.bot.edit_message_text(answer, reply_markup=reply_markup, chat_id=placeholder_message.chat_id, message_id=placeholder_message.message_id)
 
                 await asyncio.sleep(0.01)  # wait a bit to avoid flooding
 
                 prev_answer = answer
-
+            
             # update user data
-            new_dialog_message = {"user": _message, "bot": answer, "date": datetime.now()}
-            db.set_dialog_messages(
-                user_id,
-                db.get_dialog_messages(user_id, dialog_id=None) + [new_dialog_message],
-                dialog_id=None
-            )
+            if chat_type != 'prompt_evaluation' and chat_type != 'prompt_translation' and chat_type != 'prompt_vocabulary' and chat_type != 'prompt_artist':
+                new_dialog_message = {"user": _message, "bot": answer, "date": datetime.now()}
+                db.set_dialog_messages(
+                    user_id,
+                    db.get_dialog_messages(user_id, dialog_id=None) + [new_dialog_message],
+                    dialog_id=None
+                )
+            else:
+                pattern = r'falaria:\s*(.*)'
+                match = re.search(pattern, answer)
+                if match:
+                    eval_message = match.group(1)
 
             db.update_n_used_tokens(user_id, current_model, n_input_tokens, n_output_tokens)
 
@@ -304,14 +339,17 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
             await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
     async with user_semaphores[user_id]:
-        types = []
-        types.append('prompt_evaluation')
-        types.append('prompt_answer')
-        for type in types:
+        global chat_types
+
+        if not chat_types:
+            chat_types.append('prompt_evaluation')
+            chat_types.append('prompt_answer')
+
+        for chat_type in chat_types:
+            task = asyncio.create_task(message_handle_fn(chat_type))
+            user_tasks[user_id] = task
             try:    
-                task = asyncio.create_task(message_handle_fn(type))
                 await task
-                user_tasks[user_id] = task
             except asyncio.CancelledError:
                 await update.message.reply_text("✅ Canceled", parse_mode=ParseMode.HTML)
             else:
@@ -320,8 +358,9 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
                 if user_id in user_tasks:
                     del user_tasks[user_id]
 
+            await asyncio.sleep(1)  # wait a bit to avoid flooding
 
-
+        chat_types.clear()           
 
 async def is_previous_message_not_answered_yet(update: Update, context: CallbackContext):
     await register_user_if_not_exists(update, context, update.message.from_user)
@@ -520,6 +559,48 @@ async def set_chat_mode_handle(update: Update, context: CallbackContext):
         parse_mode=ParseMode.HTML
     )
 
+async def set_option(update: Update, context: CallbackContext):
+    await register_user_if_not_exists(update.callback_query, context, update.callback_query.from_user)
+
+    user_id = update.callback_query.from_user.id
+    db.set_user_attribute(user_id, "last_interaction", datetime.now())
+    
+    query = update.callback_query
+    await query.answer()
+
+    option = query.data.split("|")[1]
+
+    dialog_messages = db.get_dialog_messages(user_id, dialog_id=None)
+    if len(dialog_messages) == 0:
+        await update.message.reply_text("No message to retry 🤷‍♂️")
+        return
+
+    last_dialog_message = dialog_messages.pop()
+    
+    global chat_types
+    global update_storage
+    global context_storage
+
+    if option == "prompt_translation":
+        chat_types = ['prompt_translation']
+        await message_handle(update_storage, context_storage, message=last_dialog_message["bot"], use_new_dialog_timeout=False)
+    elif option == "prompt_vocabulary":
+        chat_types = ['prompt_vocabulary']
+        await message_handle(update_storage, context_storage, message=last_dialog_message["bot"], use_new_dialog_timeout=False)
+    elif option == "prompt_artist":
+        chat_types = ['prompt_artist']
+        await message_handle(update_storage, context_storage, message=last_dialog_message["bot"], use_new_dialog_timeout=False)
+
+async def get_options():
+    # buttons to choose models
+    buttons = [
+        [InlineKeyboardButton("Traduzir", callback_data=f"set_option|prompt_translation")],
+        [InlineKeyboardButton("Vocabulário", callback_data=f"set_option|prompt_vocabulary")],
+        [InlineKeyboardButton("Mostrar Cena", callback_data=f"set_option|prompt_artist")]
+    ]
+    reply_markup = InlineKeyboardMarkup(buttons)
+
+    return reply_markup
 
 def get_settings_menu(user_id: int):
     current_model = db.get_user_attribute(user_id, "current_model")
@@ -665,6 +746,7 @@ async def post_init(application: Application):
         BotCommand("/help", "Show help message"),
     ])
 
+
 def run_bot() -> None:
     application = (
         ApplicationBuilder()
@@ -705,6 +787,8 @@ def run_bot() -> None:
     application.add_handler(CallbackQueryHandler(set_settings_handle, pattern="^set_settings"))
 
     application.add_handler(CommandHandler("balance", show_balance_handle, filters=user_filter))
+
+    application.add_handler(CallbackQueryHandler(set_option, pattern="^set_option"))
 
     application.add_error_handler(error_handle)
 

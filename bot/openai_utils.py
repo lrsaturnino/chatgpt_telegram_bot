@@ -2,15 +2,12 @@ import config
 
 import tiktoken
 import openai
-import logging
 
 
 # setup openai
 openai.api_key = config.openai_api_key
 if config.openai_api_base is not None:
     openai.api_base = config.openai_api_base
-
-logger = logging.getLogger(__name__)
 
 OPENAI_COMPLETION_OPTIONS = {
     "temperature": 0,
@@ -35,12 +32,14 @@ class ChatGPT:
             try:
                 if self.model in {"gpt-3.5-turbo-16k", "gpt-3.5-turbo", "gpt-4"}:
                     messages = self._generate_prompt_messages(message, dialog_messages, chat_mode, chat_type)
+                    print('input', messages)
+
                     r = await openai.ChatCompletion.acreate(
                         model=self.model,
                         messages=messages,
                         **OPENAI_COMPLETION_OPTIONS
                     )
-                    print(r)
+                    print('output', r)
                     answer = r.choices[0].message["content"]
                 elif self.model == "text-davinci-003":
                     prompt = self._generate_prompt(message, dialog_messages, chat_mode, chat_type)

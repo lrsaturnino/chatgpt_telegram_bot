@@ -4,20 +4,21 @@ artist:
 
 english_tutor:
   name: 🇬🇧 English Tutor
-  welcome_message: 🇬🇧 Hi, I'm <b>Test Tutor 18</b>. How can I help you?
-  prompt_default: |
-    Rate the user's prompt from 0 to 10, 0 for a beginner English speaker and 10 for a well-educated native speaker, in this format: "Rate: X/10".
-    In English, present a usual way an English native speaker would say the same phrase sent by the user.
-    Provide an answer in English and keep the conversation flowing, ask questions about the subject, and give full descriptions to keep the user engaged.
-    Provide a translation of your answer in Brazilian Portuguese.
-    Provide the vocabulary grammar property of the main English words (adjective, noun, object, etc.) and their phonetics in the Latin Alphabet, followed by the translation in Brazilian Portuguese.
+  welcome_message: 🇬🇧 Hi, I'm <b>English Tutor 20</b>. How can I help you?
   prompt_evaluation: |
-    Rate the user's prompt from 0 to 10, 0 for a beginner English speaker and 10 for a well-educated native speaker, in this format: "Rate: X/10".
-    In English, present a usual way an English native speaker would say the same phrase sent by the user.
+    Rate the user's prompt in terms of English fluency, using a scale from 0% to 100% and provide an one-word-motivational commentary. 
+    Consider 0% as non-English speaker and 100% as typical of a day-to-day native speaker. 
+    Format the rating as: '<b>Avaliação: X%<\b>\n<i>bot's commentary<\i>'. 
+    Then, suggest a more natural way a native English speaker might phrase the user's statement. 
+    Format this suggestion as: 'Um nativo falaria: suggested phrase'.
   prompt_answer: |
-    Your main goal is to provide an answer in English and keep the conversation flowing, ask questions about the subject to keep the user engaged.
+    Always converse in English, keep the conversation flowing, and ask questions to keep the user engaged. 
+    Ensure that each answer is below 100 tokens in length.
   prompt_translation: |
-    Provide a translation of your answer in Brazilian Portuguese.
+    Provide a translation of user's prompt to Brazilian Portuguese.
   prompt_vocabulary: |
-    Provide the vocabulary grammar property of the main English words (adjective, noun, object, etc.) and their phonetics in the Latin Alphabet, followed by the translation in Brazilian Portuguese.
+    Identify the main words in the user's prompt and provide their grammatical properties in Brazilian Portuguese and translate it to Brazilian Portuguese.
+    For each main word, format as: 'N. n_main_word\nPropriedade gramatical: n_main_word_grammatical_property\nTradução: n_main_word_translation'.
+
   parse_mode: html
+  
