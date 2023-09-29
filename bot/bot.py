@@ -37,6 +37,7 @@ from telegram.constants import ParseMode, ChatAction
 import config
 import database
 import openai_utils
+import google_utils
 
 # setup
 db = database.Database()
@@ -196,8 +197,6 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
         await edited_message_handle(update, context)
         return
     
-    print('update_inside_message', update)
-
     _message = message or update.message.text
     
     # remove bot mention (in group chats)
@@ -220,13 +219,13 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
         global update_storage
         global context_storage
 
-        reply_markup = None
+        reply_markup_answer = None
+        reply_markup_evaluation = None
 
         if chat_type == 'prompt_answer':
             update_storage = update
             context_storage = context
-            reply_markup = await get_options()
-
+            reply_markup_answer = await get_options()
 
         # new dialog timeout
         if use_new_dialog_timeout:
@@ -256,7 +255,7 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
             
             dialog_messages = []
 
-            if chat_type != 'prompt_evaluation' and chat_type != 'prompt_translation' and chat_type != 'prompt_vocabulary' and chat_type != 'prompt_artist':
+            if chat_type == 'prompt_answer':
                 dialog_messages = db.get_dialog_messages(user_id, dialog_id=None)
 
             parse_mode = {
@@ -291,20 +290,28 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
                 if abs(len(answer) - len(prev_answer)) < 100 and status != "finished":
                     continue
 
-                try:
-                    await context.bot.edit_message_text(answer, reply_markup=reply_markup, chat_id=placeholder_message.chat_id, message_id=placeholder_message.message_id, parse_mode=parse_mode)
-                except telegram.error.BadRequest as e:
-                    if str(e).startswith("Message is not modified"):
-                        continue
-                    else:
-                        await context.bot.edit_message_text(answer, reply_markup=reply_markup, chat_id=placeholder_message.chat_id, message_id=placeholder_message.message_id)
+                if chat_type == 'prompt_answer':
+                    audio_content = await google_utils.synthesize_text(text=answer, loc=config.chat_modes[chat_mode]["loc"])
+                    await context.bot.delete_message(chat_id=placeholder_message.chat_id, message_id=placeholder_message.message_id)
+                    with open('output.ogg', "wb") as out:
+                        out.write(audio_content)
+                    with open('output.ogg', "rb") as audio_file:
+                        await context.bot.send_audio(chat_id=user_id, reply_markup=reply_markup_answer, audio=audio_file, caption=f'🔊: <i>{answer}</i>', parse_mode=ParseMode.HTML)
+                else:
+                    try:
+                        await context.bot.edit_message_text(answer, reply_markup=reply_markup_evaluation, chat_id=placeholder_message.chat_id, message_id=placeholder_message.message_id, parse_mode=parse_mode)
+                    except telegram.error.BadRequest as e:
+                        if str(e).startswith("Message is not modified"):
+                            continue
+                        else:
+                            await context.bot.edit_message_text(answer, reply_markup=reply_markup_evaluation, chat_id=placeholder_message.chat_id, message_id=placeholder_message.message_id)
 
                 await asyncio.sleep(0.01)  # wait a bit to avoid flooding
 
                 prev_answer = answer
             
             # update user data
-            if chat_type != 'prompt_evaluation' and chat_type != 'prompt_translation' and chat_type != 'prompt_vocabulary' and chat_type != 'prompt_artist':
+            if chat_type == 'prompt_answer':
                 new_dialog_message = {"user": _message, "bot": answer, "date": datetime.now()}
                 db.set_dialog_messages(
                     user_id,
