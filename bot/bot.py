@@ -46,7 +46,8 @@ logger = logging.getLogger(__name__)
 user_semaphores = {}
 user_tasks = {}
 chat_types = []
-eval_message = None
+suggested_message = None
+suggested_message_to_audio = None
 update_storage = {}
 context_storage = {}
 
@@ -167,7 +168,7 @@ async def help_group_chat_handle(update: Update, context: CallbackContext):
      text = HELP_GROUP_CHAT_MESSAGE.format(bot_username="@" + context.bot.username)
 
      await update.message.reply_text(text, parse_mode=ParseMode.HTML)
-     await update.message.reply_video(config.help_group_chat_video_path)
+     #await update.message.reply_video(config.help_group_chat_video_path)
 
 
 async def retry_handle(update: Update, context: CallbackContext):
@@ -186,6 +187,21 @@ async def retry_handle(update: Update, context: CallbackContext):
     db.set_dialog_messages(user_id, dialog_messages, dialog_id=None)  # last message was removed from the context
 
     await message_handle(update, context, message=last_dialog_message["user"], use_new_dialog_timeout=False)
+
+async def text_to_speech_handle(update: Update, context: CallbackContext):
+    await register_user_if_not_exists(update, context, update.message.from_user)
+    if await is_previous_message_not_answered_yet(update, context): return
+
+    user_id = update.message.from_user.id
+    db.set_user_attribute(user_id, "last_interaction", datetime.now())
+    chat_mode = db.get_user_attribute(user_id, "current_chat_mode")
+
+    global suggested_message_to_audio
+    audio_content = await google_utils.synthesize_text(text=suggested_message_to_audio, loc=config.chat_modes[chat_mode]["loc"])
+    with open('output.ogg', "wb") as out:
+        out.write(audio_content)
+    with open('output.ogg', "rb") as audio_file:
+        await context.bot.send_audio(chat_id=user_id, audio=audio_file)    
 
 async def message_handle(update: Update, context: CallbackContext, message=None, use_new_dialog_timeout=True):
     # check if bot was mentioned (for group chats)
@@ -208,24 +224,28 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
 
     user_id = update.message.from_user.id
     chat_mode = db.get_user_attribute(user_id, "current_chat_mode")
-
-    if chat_mode == "artist":
-        await generate_image_handle(update, context, message=message)
-        return
-
+    
     async def message_handle_fn(chat_type, _message=_message, update=update, context=context):
         
-        global eval_message
+        global suggested_message
+        global suggested_message_to_audio
         global update_storage
         global context_storage
 
         reply_markup_answer = None
-        reply_markup_evaluation = None
+        reply_markup_suggestion = None
 
         if chat_type == 'prompt_answer':
             update_storage = update
             context_storage = context
-            reply_markup_answer = await get_options()
+            reply_markup_answer = await get_answer_options()
+        elif chat_type == 'prompt_suggestion':
+            update_storage = update
+            context_storage = context
+            reply_markup_suggestion = await get_suggestion_audio_option()
+        elif chat_type == "prompt_artist":
+            await generate_image_handle(update, context, message=message)
+            return None
 
         # new dialog timeout
         if use_new_dialog_timeout:
@@ -249,9 +269,9 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
                 await update.message.reply_text("🥲 You sent <b>empty message</b>. Please, try again!", parse_mode=ParseMode.HTML)
                 return
             
-            if eval_message is not None:
-                _message = eval_message
-                eval_message = None
+            if suggested_message is not None:
+                _message = suggested_message
+                suggested_message = None
             
             dialog_messages = []
 
@@ -292,19 +312,27 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
 
                 if chat_type == 'prompt_answer':
                     audio_content = await google_utils.synthesize_text(text=answer, loc=config.chat_modes[chat_mode]["loc"])
-                    await context.bot.delete_message(chat_id=placeholder_message.chat_id, message_id=placeholder_message.message_id)
                     with open('output.ogg', "wb") as out:
                         out.write(audio_content)
                     with open('output.ogg', "rb") as audio_file:
+                        await context.bot.delete_message(chat_id=placeholder_message.chat_id, message_id=placeholder_message.message_id)
                         await context.bot.send_audio(chat_id=user_id, reply_markup=reply_markup_answer, audio=audio_file, caption=f'🔊: <i>{answer}</i>', parse_mode=ParseMode.HTML)
-                else:
+                elif chat_type == 'prompt_translation':
                     try:
-                        await context.bot.edit_message_text(answer, reply_markup=reply_markup_evaluation, chat_id=placeholder_message.chat_id, message_id=placeholder_message.message_id, parse_mode=parse_mode)
+                        await context.bot.edit_message_text(f'🇧🇷: <i>{answer}</i>', chat_id=placeholder_message.chat_id, message_id=placeholder_message.message_id, parse_mode=ParseMode.HTML)
                     except telegram.error.BadRequest as e:
                         if str(e).startswith("Message is not modified"):
                             continue
                         else:
-                            await context.bot.edit_message_text(answer, reply_markup=reply_markup_evaluation, chat_id=placeholder_message.chat_id, message_id=placeholder_message.message_id)
+                            await context.bot.edit_message_text(answer, chat_id=placeholder_message.chat_id, message_id=placeholder_message.message_id)                    
+                else:
+                    try:
+                        await context.bot.edit_message_text(answer, reply_markup=reply_markup_suggestion, chat_id=placeholder_message.chat_id, message_id=placeholder_message.message_id, parse_mode=parse_mode)
+                    except telegram.error.BadRequest as e:
+                        if str(e).startswith("Message is not modified"):
+                            continue
+                        else:
+                            await context.bot.edit_message_text(answer, reply_markup=reply_markup_suggestion, chat_id=placeholder_message.chat_id, message_id=placeholder_message.message_id)
 
                 await asyncio.sleep(0.01)  # wait a bit to avoid flooding
 
@@ -318,11 +346,12 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
                     db.get_dialog_messages(user_id, dialog_id=None) + [new_dialog_message],
                     dialog_id=None
                 )
-            else:
-                pattern = r'falaria:\s*(.*)'
+            elif chat_type == 'prompt_suggestion':
+                pattern = r'<i>(.*)</i>'
                 match = re.search(pattern, answer)
                 if match:
-                    eval_message = match.group(1)
+                    suggested_message = match.group(1)
+                    suggested_message_to_audio = suggested_message
 
             db.update_n_used_tokens(user_id, current_model, n_input_tokens, n_output_tokens)
 
@@ -346,13 +375,16 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
             await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
     async with user_semaphores[user_id]:
+        
         global chat_types
 
         if not chat_types:
             chat_types.append('prompt_evaluation')
+            chat_types.append('prompt_suggestion')
             chat_types.append('prompt_answer')
 
         for chat_type in chat_types:
+            await asyncio.sleep(1)  # wait a bit to avoid flooding
             task = asyncio.create_task(message_handle_fn(chat_type))
             user_tasks[user_id] = task
             try:    
@@ -364,8 +396,6 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
             finally:
                 if user_id in user_tasks:
                     del user_tasks[user_id]
-
-            await asyncio.sleep(1)  # wait a bit to avoid flooding
 
         chat_types.clear()           
 
@@ -424,7 +454,6 @@ async def voice_message_handle(update: Update, context: CallbackContext):
 
 async def generate_image_handle(update: Update, context: CallbackContext, message=None):
     await register_user_if_not_exists(update, context, update.message.from_user)
-    if await is_previous_message_not_answered_yet(update, context): return
 
     user_id = update.message.from_user.id
     db.set_user_attribute(user_id, "last_interaction", datetime.now())
@@ -577,12 +606,9 @@ async def set_option(update: Update, context: CallbackContext):
 
     option = query.data.split("|")[1]
 
-    dialog_messages = db.get_dialog_messages(user_id, dialog_id=None)
-    if len(dialog_messages) == 0:
-        await update.message.reply_text("No message to retry 🤷‍♂️")
-        return
-
-    last_dialog_message = dialog_messages.pop()
+    if option != "prompt_suggestion":
+        dialog_messages = db.get_dialog_messages(user_id, dialog_id=None)
+        last_dialog_message = dialog_messages.pop()
     
     global chat_types
     global update_storage
@@ -597,8 +623,10 @@ async def set_option(update: Update, context: CallbackContext):
     elif option == "prompt_artist":
         chat_types = ['prompt_artist']
         await message_handle(update_storage, context_storage, message=last_dialog_message["bot"], use_new_dialog_timeout=False)
+    elif option == "prompt_suggestion":
+        await text_to_speech_handle(update_storage, context_storage)
 
-async def get_options():
+async def get_answer_options():
     # buttons to choose models
     buttons = [
         [InlineKeyboardButton("Traduzir", callback_data=f"set_option|prompt_translation")],
@@ -608,6 +636,16 @@ async def get_options():
     reply_markup = InlineKeyboardMarkup(buttons)
 
     return reply_markup
+
+async def get_suggestion_audio_option():
+    # buttons to choose models
+    buttons = [
+        [InlineKeyboardButton("Ouvir a sugestão", callback_data=f"set_option|prompt_suggestion")],
+    ]
+    reply_markup = InlineKeyboardMarkup(buttons)
+
+    return reply_markup
+
 
 def get_settings_menu(user_id: int):
     current_model = db.get_user_attribute(user_id, "current_model")
