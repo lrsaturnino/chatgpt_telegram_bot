@@ -45,11 +45,7 @@ logger = logging.getLogger(__name__)
 
 user_semaphores = {}
 user_tasks = {}
-chat_types = []
-suggested_message = None
-suggested_message_to_audio = None
-update_storage = {}
-context_storage = {}
+user_storage = {}
 
 HELP_MESSAGE = """Commands:
 ⚪ /retry – Regenerate last bot answer
@@ -81,10 +77,15 @@ def split_text_into_chunks(text, chunk_size):
 
 
 async def register_user_if_not_exists(update: Update, context: CallbackContext, user: User):
+    if update.callback_query is not None:
+        chat_id = update.callback_query.message.chat.id
+    else:
+        chat_id = update.message.chat_id
+    
     if not db.check_if_user_exists(user.id):
         db.add_new_user(
             user.id,
-            update.message.chat_id,
+            chat_id,
             username=user.username,
             first_name=user.first_name,
             last_name= user.last_name
@@ -119,7 +120,12 @@ async def register_user_if_not_exists(update: Update, context: CallbackContext, 
     if db.get_user_attribute(user.id, "n_generated_images") is None:
         db.set_user_attribute(user.id, "n_generated_images", 0)
 
-
+    if user.id not in user_storage:
+        user_storage[user.id] = {
+            "suggested_message": None
+        }
+    
+    
 async def is_bot_mentioned(update: Update, context: CallbackContext):
      try:
          message = update.message
@@ -186,24 +192,205 @@ async def retry_handle(update: Update, context: CallbackContext):
     last_dialog_message = dialog_messages.pop()
     db.set_dialog_messages(user_id, dialog_messages, dialog_id=None)  # last message was removed from the context
 
-    await message_handle(update, context, message=last_dialog_message["user"], use_new_dialog_timeout=False)
+    await response_handle(update, context, message=last_dialog_message["user"], use_new_dialog_timeout=False)
+
 
 async def text_to_speech_handle(update: Update, context: CallbackContext):
-    await register_user_if_not_exists(update, context, update.message.from_user)
-    if await is_previous_message_not_answered_yet(update, context): return
+    if update.callback_query is not None:
+        user_id = update.callback_query.from_user.id
+        chat_id = update.callback_query.message.chat_id
+    else:    
+        user_id = update.message.from_user.id
+        chat_id = update.message.chat_id
 
-    user_id = update.message.from_user.id
     db.set_user_attribute(user_id, "last_interaction", datetime.now())
     chat_mode = db.get_user_attribute(user_id, "current_chat_mode")
 
-    global suggested_message_to_audio
-    audio_content = await google_utils.synthesize_text(text=suggested_message_to_audio, loc=config.chat_modes[chat_mode]["loc"])
+    audio_content = await google_utils.synthesize_text(text=user_storage[user_id]['suggested_message'], loc=config.chat_modes[chat_mode]["loc"])
+    
     with open('output.ogg', "wb") as out:
         out.write(audio_content)
+        
     with open('output.ogg', "rb") as audio_file:
-        await context.bot.send_audio(chat_id=user_id, audio=audio_file)    
+        await context.bot.send_audio(chat_id, audio=audio_file)    
 
-async def message_handle(update: Update, context: CallbackContext, message=None, use_new_dialog_timeout=True):
+
+async def message_handle(chat_type, _message, update, context):
+    if update.callback_query is not None:
+        user_id = update.callback_query.from_user.id
+    else:    
+        user_id = update.message.from_user.id
+
+    chat_mode = db.get_user_attribute(user_id, "current_chat_mode")
+
+    reply_markup = None
+
+    if chat_type == 'prompt_answer':
+        reply_markup = await get_answer_options()
+    elif chat_type == 'prompt_suggestion':
+        reply_markup = await get_suggestion_audio_option()
+        user_storage[user_id]['suggested_message'] = None
+    elif chat_type == "prompt_artist":
+        await generate_image_handle(update, context, message=_message)
+        return
+
+    db.set_user_attribute(user_id, "last_interaction", datetime.now())
+
+    # in case of CancelledError
+    n_input_tokens, n_output_tokens = 0, 0
+    current_model = db.get_user_attribute(user_id, "current_model")
+
+    try:
+        if update.callback_query is not None:
+            chat_id = update.callback_query.message.chat_id
+
+            # send placeholder message to user
+            placeholder_message = await context.bot.send_message(chat_id, text="...")
+
+            # send typing action
+            await context.bot.send_chat_action(chat_id, action=ChatAction.TYPING)
+
+            if _message is None or len(_message) == 0:
+                await context.bot.delete_message(chat_id=placeholder_message.chat_id, message_id=placeholder_message.message_id)
+                await context.bot.send_message(chat_id=placeholder_message.chat_id, text="🥲 You sent <b>empty message</b>. Please, try again!", parse_mode=ParseMode.HTML)
+                return
+        else:
+            chat_id = update.message.chat_id
+
+            # send placeholder message to user
+            placeholder_message = await update.message.reply_text("...")
+
+            # send typing action
+            await update.message.chat.send_action(action="typing")
+
+            if _message is None or len(_message) == 0:
+                await context.bot.delete_message(chat_id=placeholder_message.chat_id, message_id=placeholder_message.message_id)
+                await update.message.reply_text("🥲 You sent <b>empty message</b>. Please, try again!", parse_mode=ParseMode.HTML)
+                return
+        
+        if user_storage[user_id]['suggested_message'] is not None:
+            _message = user_storage[user_id]['suggested_message']
+
+        dialog_messages = []
+
+        if chat_type == 'prompt_answer':
+            dialog_messages = db.get_dialog_messages(user_id, dialog_id=None)
+
+        parse_mode = {
+            "html": ParseMode.HTML,
+            "markdown": ParseMode.MARKDOWN
+        }[config.chat_modes[chat_mode]["parse_mode"]]
+
+        chatgpt_instance = openai_utils.ChatGPT(model=current_model)
+        if config.enable_message_streaming:
+            gen = chatgpt_instance.send_message_stream(_message, dialog_messages=dialog_messages, chat_mode=chat_mode, chat_type=chat_type)
+        else:
+            answer, (n_input_tokens, n_output_tokens), n_first_dialog_messages_removed = await chatgpt_instance.send_message(
+                _message,
+                dialog_messages=dialog_messages,
+                chat_mode=chat_mode,
+                chat_type=chat_type
+            )
+
+            async def fake_gen():
+                yield "finished", answer, (n_input_tokens, n_output_tokens), n_first_dialog_messages_removed
+
+            gen = fake_gen()
+
+        prev_answer = ""
+
+        async for gen_item in gen:
+            status, answer, (n_input_tokens, n_output_tokens), n_first_dialog_messages_removed = gen_item
+
+            answer = answer[:4096]  # telegram message limit
+
+            # update only when 100 new symbols are ready
+            if abs(len(answer) - len(prev_answer)) < 100 and status != "finished":
+                continue
+
+            if chat_type == 'prompt_answer':
+                audio_content = await google_utils.synthesize_text(text=answer, loc=config.chat_modes[chat_mode]["loc"])
+                
+                with open('output.ogg', "wb") as out:
+                    out.write(audio_content)
+                
+                with open('output.ogg', "rb") as audio_file:
+                    await context.bot.delete_message(chat_id=placeholder_message.chat_id, message_id=placeholder_message.message_id)
+                    await context.bot.send_audio(chat_id, reply_markup=reply_markup, audio=audio_file, caption=f'🔊: <i>{answer}</i>', parse_mode=ParseMode.HTML)
+            elif chat_type == 'prompt_translation':
+                try:
+                    await context.bot.edit_message_text(f'🇧🇷: <i>{answer}</i>', chat_id=placeholder_message.chat_id, message_id=placeholder_message.message_id, parse_mode=ParseMode.HTML)
+                except telegram.error.BadRequest as e:
+                    if str(e).startswith("Message is not modified"):
+                        continue
+                    else:
+                        await context.bot.edit_message_text(answer, chat_id=placeholder_message.chat_id, message_id=placeholder_message.message_id)                    
+            else:
+                try:
+                    await context.bot.edit_message_text(answer, reply_markup=reply_markup, chat_id=placeholder_message.chat_id, message_id=placeholder_message.message_id, parse_mode=parse_mode)
+                except telegram.error.BadRequest as e:
+                    if str(e).startswith("Message is not modified"):
+                        continue
+                    else:
+                        await context.bot.edit_message_text(answer, reply_markup=reply_markup, chat_id=placeholder_message.chat_id, message_id=placeholder_message.message_id)
+
+            await asyncio.sleep(0.01)  # wait a bit to avoid flooding
+
+            prev_answer = answer
+        
+        # update user data
+        if chat_type == 'prompt_answer':
+            new_dialog_message = {"user": _message, "bot": answer, "date": datetime.now()}
+            db.set_dialog_messages(
+                user_id,
+                db.get_dialog_messages(user_id, dialog_id=None) + [new_dialog_message],
+                dialog_id=None
+            )
+        elif chat_type == 'prompt_suggestion':
+            pattern = r'<i>(.*)</i>'
+            match = re.search(pattern, answer)
+            if match:
+                user_storage[user_id]['suggested_message'] = match.group(1)
+
+        print('user_id_in_message_handle', user_id)
+        print('suggested_message_in_message_handle', user_storage[user_id]['suggested_message'])
+
+        db.update_n_used_tokens(user_id, current_model, n_input_tokens, n_output_tokens)
+
+    except asyncio.CancelledError:
+        # note: intermediate token updates only work when enable_message_streaming=True (config.yml)
+        db.update_n_used_tokens(user_id, current_model, n_input_tokens, n_output_tokens)
+        raise
+
+    except Exception as e:
+        text = f"Something went wrong during completion. Reason: {e}"
+        logger.error(text)
+        await context.bot.delete_message(chat_id=placeholder_message.chat_id, message_id=placeholder_message.message_id)
+        if update.callback_query is not None:
+            chat_id = update.callback_query.message.chat_id
+            await context.bot.send_message(chat_id, text)
+        else:
+            await update.message.reply_text(text)
+        return
+
+    # send message if some messages were removed from the context
+    if n_first_dialog_messages_removed > 0:
+        if n_first_dialog_messages_removed == 1:
+            text = "✍️ <i>Note:</i> Your current dialog is too long, so your <b>first message</b> was removed from the context.\n Send /new command to start new dialog"
+        else:
+            text = f"✍️ <i>Note:</i> Your current dialog is too long, so <b>{n_first_dialog_messages_removed} first messages</b> were removed from the context.\n Send /new command to start new dialog"
+        
+        if update.callback_query is not None:
+            chat_id = update.callback_query.message.chat_id
+            await context.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
+        else:
+            await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+async def response_handle(update: Update, context: CallbackContext, message=None, use_new_dialog_timeout=True):
+    await register_user_if_not_exists(update, context, update.message.from_user)
+    if await is_previous_message_not_answered_yet(update, context): return
+
     # check if bot was mentioned (for group chats)
     if not await is_bot_mentioned(update, context):
         return
@@ -212,180 +399,32 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
     if update.edited_message is not None:
         await edited_message_handle(update, context)
         return
-    
+
     _message = message or update.message.text
     
     # remove bot mention (in group chats)
     if update.message.chat.type != "private":
         _message = _message.replace("@" + context.bot.username, "").strip()
 
-    await register_user_if_not_exists(update, context, update.message.from_user)
-    if await is_previous_message_not_answered_yet(update, context): return
-
     user_id = update.message.from_user.id
     chat_mode = db.get_user_attribute(user_id, "current_chat_mode")
-    
-    async def message_handle_fn(chat_type, _message=_message, update=update, context=context):
-        
-        global suggested_message
-        global suggested_message_to_audio
-        global update_storage
-        global context_storage
 
-        reply_markup_answer = None
-        reply_markup_suggestion = None
-
-        if chat_type == 'prompt_answer':
-            update_storage = update
-            context_storage = context
-            reply_markup_answer = await get_answer_options()
-        elif chat_type == 'prompt_suggestion':
-            update_storage = update
-            context_storage = context
-            reply_markup_suggestion = await get_suggestion_audio_option()
-        elif chat_type == "prompt_artist":
-            await generate_image_handle(update, context, message=message)
-            return None
-
-        # new dialog timeout
-        if use_new_dialog_timeout:
-            if (datetime.now() - db.get_user_attribute(user_id, "last_interaction")).seconds > config.new_dialog_timeout and len(db.get_dialog_messages(user_id)) > 0:
-                db.start_new_dialog(user_id)
-                await update.message.reply_text(f"Starting new dialog due to timeout (<b>{config.chat_modes[chat_mode]['name']}</b> mode) ✅", parse_mode=ParseMode.HTML)
-        db.set_user_attribute(user_id, "last_interaction", datetime.now())
-
-        # in case of CancelledError
-        n_input_tokens, n_output_tokens = 0, 0
-        current_model = db.get_user_attribute(user_id, "current_model")
-
-        try:
-            # send placeholder message to user
-            placeholder_message = await update.message.reply_text("...")
-
-            # send typing action
-            await update.message.chat.send_action(action="typing")
-
-            if _message is None or len(_message) == 0:
-                await update.message.reply_text("🥲 You sent <b>empty message</b>. Please, try again!", parse_mode=ParseMode.HTML)
-                return
-            
-            if suggested_message is not None:
-                _message = suggested_message
-                suggested_message = None
-            
-            dialog_messages = []
-
-            if chat_type == 'prompt_answer':
-                dialog_messages = db.get_dialog_messages(user_id, dialog_id=None)
-
-            parse_mode = {
-                "html": ParseMode.HTML,
-                "markdown": ParseMode.MARKDOWN
-            }[config.chat_modes[chat_mode]["parse_mode"]]
-
-            chatgpt_instance = openai_utils.ChatGPT(model=current_model)
-            if config.enable_message_streaming:
-                gen = chatgpt_instance.send_message_stream(_message, dialog_messages=dialog_messages, chat_mode=chat_mode, chat_type=chat_type)
-            else:
-                answer, (n_input_tokens, n_output_tokens), n_first_dialog_messages_removed = await chatgpt_instance.send_message(
-                    _message,
-                    dialog_messages=dialog_messages,
-                    chat_mode=chat_mode,
-                    chat_type=chat_type
-                )
-
-                async def fake_gen():
-                    yield "finished", answer, (n_input_tokens, n_output_tokens), n_first_dialog_messages_removed
-
-                gen = fake_gen()
-
-            prev_answer = ""
-
-            async for gen_item in gen:
-                status, answer, (n_input_tokens, n_output_tokens), n_first_dialog_messages_removed = gen_item
-
-                answer = answer[:4096]  # telegram message limit
-
-                # update only when 100 new symbols are ready
-                if abs(len(answer) - len(prev_answer)) < 100 and status != "finished":
-                    continue
-
-                if chat_type == 'prompt_answer':
-                    audio_content = await google_utils.synthesize_text(text=answer, loc=config.chat_modes[chat_mode]["loc"])
-                    with open('output.ogg', "wb") as out:
-                        out.write(audio_content)
-                    with open('output.ogg', "rb") as audio_file:
-                        await context.bot.delete_message(chat_id=placeholder_message.chat_id, message_id=placeholder_message.message_id)
-                        await context.bot.send_audio(chat_id=user_id, reply_markup=reply_markup_answer, audio=audio_file, caption=f'🔊: <i>{answer}</i>', parse_mode=ParseMode.HTML)
-                elif chat_type == 'prompt_translation':
-                    try:
-                        await context.bot.edit_message_text(f'🇧🇷: <i>{answer}</i>', chat_id=placeholder_message.chat_id, message_id=placeholder_message.message_id, parse_mode=ParseMode.HTML)
-                    except telegram.error.BadRequest as e:
-                        if str(e).startswith("Message is not modified"):
-                            continue
-                        else:
-                            await context.bot.edit_message_text(answer, chat_id=placeholder_message.chat_id, message_id=placeholder_message.message_id)                    
-                else:
-                    try:
-                        await context.bot.edit_message_text(answer, reply_markup=reply_markup_suggestion, chat_id=placeholder_message.chat_id, message_id=placeholder_message.message_id, parse_mode=parse_mode)
-                    except telegram.error.BadRequest as e:
-                        if str(e).startswith("Message is not modified"):
-                            continue
-                        else:
-                            await context.bot.edit_message_text(answer, reply_markup=reply_markup_suggestion, chat_id=placeholder_message.chat_id, message_id=placeholder_message.message_id)
-
-                await asyncio.sleep(0.01)  # wait a bit to avoid flooding
-
-                prev_answer = answer
-            
-            # update user data
-            if chat_type == 'prompt_answer':
-                new_dialog_message = {"user": _message, "bot": answer, "date": datetime.now()}
-                db.set_dialog_messages(
-                    user_id,
-                    db.get_dialog_messages(user_id, dialog_id=None) + [new_dialog_message],
-                    dialog_id=None
-                )
-            elif chat_type == 'prompt_suggestion':
-                pattern = r'<i>(.*)</i>'
-                match = re.search(pattern, answer)
-                if match:
-                    suggested_message = match.group(1)
-                    suggested_message_to_audio = suggested_message
-
-            db.update_n_used_tokens(user_id, current_model, n_input_tokens, n_output_tokens)
-
-        except asyncio.CancelledError:
-            # note: intermediate token updates only work when enable_message_streaming=True (config.yml)
-            db.update_n_used_tokens(user_id, current_model, n_input_tokens, n_output_tokens)
-            raise
-
-        except Exception as e:
-            error_text = f"Something went wrong during completion. Reason: {e}"
-            logger.error(error_text)
-            await update.message.reply_text(error_text)
-            return
-
-        # send message if some messages were removed from the context
-        if n_first_dialog_messages_removed > 0:
-            if n_first_dialog_messages_removed == 1:
-                text = "✍️ <i>Note:</i> Your current dialog is too long, so your <b>first message</b> was removed from the context.\n Send /new command to start new dialog"
-            else:
-                text = f"✍️ <i>Note:</i> Your current dialog is too long, so <b>{n_first_dialog_messages_removed} first messages</b> were removed from the context.\n Send /new command to start new dialog"
-            await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    # new dialog timeout
+    if use_new_dialog_timeout:
+        if (datetime.now() - db.get_user_attribute(user_id, "last_interaction")).seconds > config.new_dialog_timeout and len(db.get_dialog_messages(user_id)) > 0:
+            db.start_new_dialog(user_id)
+            await update.message.reply_text(f"Starting new dialog due to timeout (<b>{config.chat_modes[chat_mode]['name']}</b> mode) ✅", parse_mode=ParseMode.HTML)
 
     async with user_semaphores[user_id]:
-        
-        global chat_types
-
-        if not chat_types:
-            chat_types.append('prompt_evaluation')
-            chat_types.append('prompt_suggestion')
-            chat_types.append('prompt_answer')
+        chat_types = []
+      
+        chat_types.append('prompt_evaluation')
+        chat_types.append('prompt_suggestion')
+        chat_types.append('prompt_answer')
 
         for chat_type in chat_types:
             await asyncio.sleep(1)  # wait a bit to avoid flooding
-            task = asyncio.create_task(message_handle_fn(chat_type))
+            task = asyncio.create_task(message_handle(chat_type, _message, update, context))
             user_tasks[user_id] = task
             try:    
                 await task
@@ -397,12 +436,15 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
                 if user_id in user_tasks:
                     del user_tasks[user_id]
 
-        chat_types.clear()           
 
 async def is_previous_message_not_answered_yet(update: Update, context: CallbackContext):
-    await register_user_if_not_exists(update, context, update.message.from_user)
-
-    user_id = update.message.from_user.id
+    if update.callback_query is not None:
+        await register_user_if_not_exists(update, context, update.callback_query.from_user)
+        user_id = update.callback_query.from_user.id
+    else:    
+        await register_user_if_not_exists(update, context, update.message.from_user)
+        user_id = update.message.from_user.id
+    
     if user_semaphores[user_id].locked():
         text = "⏳ Please <b>wait</b> for a reply to the previous message\n"
         text += "Or you can /cancel it"
@@ -449,7 +491,7 @@ async def voice_message_handle(update: Update, context: CallbackContext):
     # update n_transcribed_seconds
     db.set_user_attribute(user_id, "n_transcribed_seconds", voice.duration + db.get_user_attribute(user_id, "n_transcribed_seconds"))
 
-    await message_handle(update, context, message=transcribed_text)
+    await response_handle(update, context, message=transcribed_text)
 
 
 async def generate_image_handle(update: Update, context: CallbackContext, message=None):
@@ -596,7 +638,8 @@ async def set_chat_mode_handle(update: Update, context: CallbackContext):
     )
 
 async def set_option(update: Update, context: CallbackContext):
-    await register_user_if_not_exists(update.callback_query, context, update.callback_query.from_user)
+    await register_user_if_not_exists(update, context, update.callback_query.from_user)
+    if await is_previous_message_not_answered_yet(update, context): return
 
     user_id = update.callback_query.from_user.id
     db.set_user_attribute(user_id, "last_interaction", datetime.now())
@@ -609,22 +652,9 @@ async def set_option(update: Update, context: CallbackContext):
     if option != "prompt_suggestion":
         dialog_messages = db.get_dialog_messages(user_id, dialog_id=None)
         last_dialog_message = dialog_messages.pop()
-    
-    global chat_types
-    global update_storage
-    global context_storage
-
-    if option == "prompt_translation":
-        chat_types = ['prompt_translation']
-        await message_handle(update_storage, context_storage, message=last_dialog_message["bot"], use_new_dialog_timeout=False)
-    elif option == "prompt_vocabulary":
-        chat_types = ['prompt_vocabulary']
-        await message_handle(update_storage, context_storage, message=last_dialog_message["bot"], use_new_dialog_timeout=False)
-    elif option == "prompt_artist":
-        chat_types = ['prompt_artist']
-        await message_handle(update_storage, context_storage, message=last_dialog_message["bot"], use_new_dialog_timeout=False)
-    elif option == "prompt_suggestion":
-        await text_to_speech_handle(update_storage, context_storage)
+        await message_handle(chat_type=option, update=update, context=context, _message=last_dialog_message["bot"])
+    else:
+        await text_to_speech_handle(update, context)
 
 async def get_answer_options():
     # buttons to choose models
@@ -817,7 +847,7 @@ def run_bot() -> None:
     application.add_handler(CommandHandler("help", help_handle, filters=user_filter))
     application.add_handler(CommandHandler("help_group_chat", help_group_chat_handle, filters=user_filter))
 
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, message_handle))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, response_handle))
     application.add_handler(CommandHandler("retry", retry_handle, filters=user_filter))
     application.add_handler(CommandHandler("new", new_dialog_handle, filters=user_filter))
     application.add_handler(CommandHandler("cancel", cancel_handle, filters=user_filter))
