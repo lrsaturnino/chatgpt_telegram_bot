@@ -229,7 +229,6 @@ async def message_handle(chat_type, _message, update, context):
         reply_markup = await get_answer_options()
     elif chat_type == 'prompt_suggestion':
         reply_markup = await get_suggestion_audio_option()
-        user_storage[user_id]['suggested_message'] = None
     elif chat_type == "prompt_artist":
         await generate_image_handle(update, context, message=_message)
         return
@@ -268,12 +267,10 @@ async def message_handle(chat_type, _message, update, context):
                 await update.message.reply_text("🥲 You sent <b>empty message</b>. Please, try again!", parse_mode=ParseMode.HTML)
                 return
         
-        if user_storage[user_id]['suggested_message'] is not None:
-            _message = user_storage[user_id]['suggested_message']
-
         dialog_messages = []
 
         if chat_type == 'prompt_answer':
+            _message = user_storage[user_id]['suggested_message']
             dialog_messages = db.get_dialog_messages(user_id, dialog_id=None)
 
         parse_mode = {
@@ -351,9 +348,6 @@ async def message_handle(chat_type, _message, update, context):
             match = re.search(pattern, answer)
             if match:
                 user_storage[user_id]['suggested_message'] = match.group(1)
-
-        print('user_id_in_message_handle', user_id)
-        print('suggested_message_in_message_handle', user_storage[user_id]['suggested_message'])
 
         db.update_n_used_tokens(user_id, current_model, n_input_tokens, n_output_tokens)
 
